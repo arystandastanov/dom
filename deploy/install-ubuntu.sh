@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Установка «Дома» на сервер, где УЖЕ работает портал w7desk (Node.js и Caddy там уже стоят).
+# Установка «Дома» на сервер, где уже работает другой сайт (Node.js и Caddy там уже стоят).
 #
-#   sudo bash deploy/install-ubuntu.sh dom.w7desk.kz
+#   sudo bash deploy/install-ubuntu.sh dom.example.kz
 #
 # Что делает (и только это):
 #   1. создаёт системного пользователя dom (без входа и без sudo);
 #   2. копирует сайт в /opt/dom, данные — в /var/lib/dom (доступ только у службы dom);
-#   3. создаёт службу dom: слушает только 127.0.0.1:3101, не видит папки портала,
+#   3. создаёт службу dom: слушает только 127.0.0.1:3101, не видит папок других сайтов,
 #      ограничена 200 МБ памяти и пониженным приоритетом процессора;
 #   4. ДОБАВЛЯЕТ в конец /etc/caddy/Caddyfile отдельный блок для нового адреса
-#      (блок портала не трогается; перед правкой — копия файла; при ошибке — откат)
-#      и мягко перечитывает настройки Caddy без перерыва в работе портала.
+#      (остальные блоки не трогаются; перед правкой — копия файла; при ошибке — откат)
+#      и мягко перечитывает настройки Caddy без перерыва в работе других сайтов.
 # Что НЕ делает: не обновляет систему, не ставит и не обновляет пакеты, не трогает файрвол,
-# портал, его службу, папки и автообновление.
+# другие сайты, их службы, папки и автообновление.
 set -euo pipefail
 
 DOMAIN="${1:-}"
@@ -24,9 +24,9 @@ BEGIN_MARK='# >>> dom: семейный сайт (блок добавлен depl
 END_MARK='# <<< dom'
 
 if [ "$(id -u)" -ne 0 ]; then echo "Запустите через sudo: sudo bash deploy/install-ubuntu.sh <адрес>"; exit 1; fi
-if [ -z "$DOMAIN" ]; then echo "Укажите адрес сайта: sudo bash deploy/install-ubuntu.sh dom.w7desk.kz"; exit 1; fi
+if [ -z "$DOMAIN" ]; then echo "Укажите адрес сайта: sudo bash deploy/install-ubuntu.sh dom.example.kz"; exit 1; fi
 if ! printf '%s' "$DOMAIN" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'; then
-  echo "Адрес выглядит неверно: $DOMAIN (пример: dom.w7desk.kz)"; exit 1
+  echo "Адрес выглядит неверно: $DOMAIN (пример: dom.example.kz)"; exit 1
 fi
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 if [ ! -f "$SRC/server.js" ] || [ ! -d "$SRC/public" ]; then echo "Не найдены server.js и public/ в $SRC"; exit 1; fi
@@ -35,7 +35,7 @@ step() { printf '\n== %s\n' "$1"; }
 
 step "1/6 Проверка сервера (только чтение)"
 NODE_BIN="$(command -v node || true)"
-if [ -z "$NODE_BIN" ]; then echo "Node.js не найден — этот скрипт рассчитан на сервер, где уже работает портал."; exit 1; fi
+if [ -z "$NODE_BIN" ]; then echo "Node.js не найден — этот скрипт рассчитан на сервер, где уже работает сайт на Node.js."; exit 1; fi
 if [ "$("$NODE_BIN" -p 'process.versions.node.split(".")[0]')" -lt 18 ]; then echo "Нужен Node.js 18+, а стоит $("$NODE_BIN" -v)"; exit 1; fi
 if ! command -v caddy >/dev/null 2>&1 || [ ! -f "$CADDYFILE" ]; then echo "Caddy или $CADDYFILE не найдены."; exit 1; fi
 if grep -Eq "^[[:space:]]*$(printf '%s' "$DOMAIN" | sed 's/\./\\./g')([[:space:]]|,|\{|$)" "$CADDYFILE" && ! grep -qF "$BEGIN_MARK" "$CADDYFILE"; then
@@ -44,6 +44,10 @@ fi
 if ss -ltnH "sport = :$PORT" | grep -q . && ! systemctl is-active --quiet dom; then
   echo "Порт $PORT уже занят другой программой — ничего не меняю."; ss -ltnp "sport = :$PORT"; exit 1
 fi
+# Если Node.js установлен внутри /opt или /var/lib, открываем службе только его папку (только чтение)
+NODE_DIR="$(dirname "$(dirname "$(readlink -f "$NODE_BIN")")")"
+EXTRA_BIND=""
+case "$NODE_DIR" in /opt/*|/var/lib/*) EXTRA_BIND="BindReadOnlyPaths=$NODE_DIR";; esac
 echo "Node.js $("$NODE_BIN" -v), Caddy $(caddy version | awk '{print $1}'), порт $PORT свободен"
 free -m | awk 'NR<=2'
 
@@ -77,17 +81,20 @@ ExecStart=$NODE_BIN --max-old-space-size=96 $APP/server.js
 Restart=on-failure
 RestartSec=3
 UMask=0077
-# Ресурсы: сайт не может «съесть» память и процессор портала и Check It
+# Ресурсы: сайт не может «съесть» память и процессор соседних служб
 MemoryHigh=160M
 MemoryMax=200M
 CPUWeight=50
 Nice=5
 TasksMax=64
-# Изоляция: служба видит только свою папку данных и физически не видит папки портала
+# Изоляция: в /opt и /var/lib служба видит только свои папки — папки других сайтов для неё не существуют
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=$DATA
-InaccessiblePaths=-/opt/shtab -/var/lib/shtab -/opt/shtab-browser -/etc/caddy -/root
+TemporaryFileSystem=/opt:ro /var/lib:ro /srv:ro
+BindReadOnlyPaths=$APP
+BindPaths=$DATA
+$EXTRA_BIND
+InaccessiblePaths=-/etc/caddy
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
@@ -147,7 +154,7 @@ cat "$tmp" > "$CADDYFILE"; rm -f "$tmp"
 if ! systemctl reload caddy; then
   echo "Caddy не принял настройку — возвращаю прежний Caddyfile"; cp -a "$CADDYFILE.bak-dom-$stamp" "$CADDYFILE"; systemctl reload caddy || true; exit 1
 fi
-echo "Caddy перечитал настройки (без перезапуска, портал не прерывался)"
+echo "Caddy перечитал настройки (без перезапуска, другие сайты не прерывались)"
 
 step "6/6 Готово"
 echo "================================================================"
