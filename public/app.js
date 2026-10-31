@@ -5,6 +5,9 @@
   let S = null;                 // состояние с сервера
   const UI = { view: 'home', taskTab: 'mine', famTab: 'bills', mMonth: '', fMonth: '' };
   try { const v = localStorage.getItem('dom.view'); if (v) UI.view = v; } catch (e) {}
+  const fromHash = () => { const hv = (location.hash || '').slice(1); if (['home', 'tasks', 'cal', 'money', 'family'].includes(hv)) { UI.view = hv; history.replaceState(null, '', '/'); return true; } return false; };
+  fromHash();
+  window.addEventListener('hashchange', () => { if (fromHash() && S) render(); });
 
   /* ---------- утилиты ---------- */
   function h(tag, attrs, ...kids) {
@@ -536,6 +539,46 @@
         S.me.siri ? h('button', { class: 'btn ghost', onclick: async () => { if (confirm('Отключить Siri? Команда на iPhone перестанет работать.') && await act('/api/siri/off', {}, 'Siri отключена')) close(); } }, 'Отключить') : null)]);
   }
 
+  /* ---------- Уведомления ---------- */
+  const b64ToBytes = s => { const p = '='.repeat((4 - s.length % 4) % 4), b = atob((s + p).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from(b, c => c.charCodeAt(0)); };
+  const standalone = () => (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+  const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  async function currentSub() { try { const r = await navigator.serviceWorker.ready; return await r.pushManager.getSubscription(); } catch (e) { return null; } }
+  async function enablePush() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) throw new Error(isIOS() && !standalone() ? 'Откройте «Дом» с иконки на экране «Домой» — в обычном Safari уведомления недоступны' : 'Этот браузер не поддерживает уведомления');
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') throw new Error('Уведомления запрещены. Включите их: Настройки iPhone → Уведомления → Дом');
+    const reg = await navigator.serviceWorker.ready;
+    const { key } = await api('/api/push/key');
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
+    await api('/api/push/subscribe', sub.toJSON());
+  }
+  async function notifySettings() {
+    const here = await currentSub();
+    const prefs = S.me.notify || {};
+    const KINDS = [['family', 'Новые дела и встречи от супруга'], ['confirm', 'Оплата отмечена — нужно подтвердить'], ['confirmed', 'Моя оплата подтверждена'], ['due', 'Платёж завтра или просрочен (в 9:00)'], ['morning', 'Утренняя сводка на день (в 8:30)']];
+    const err = h('div', { class: 'err' });
+    sheet('Уведомления', close => {
+      const out = [];
+      if (isIOS() && !standalone()) out.push(h('div', { class: 'card pad hint' }, 'На iPhone уведомления работают, только если «Дом» открыт с иконки на экране «Домой»: в Safari нажмите «Поделиться» → «На экран Домой», откройте с иконки и вернитесь сюда. Нужна iOS 16.4 или новее.'));
+      out.push(h('div', { class: 'card form' },
+        h('div', { class: 'hint' }, here ? 'На этом устройстве уведомления включены.' : 'На этом устройстве уведомления выключены.'),
+        err,
+        h('div', { class: 'btns' },
+          h('button', { class: 'btn', onclick: async e => { err.textContent = ''; e.target.disabled = true; try { await enablePush(); await refresh(); toast('Уведомления включены'); close(); notifySettings(); } catch (x) { err.textContent = x.message; } e.target.disabled = false; } }, here ? 'Переподключить' : 'Включить на этом устройстве'),
+          S.me.pushDevices ? h('button', { class: 'btn sec', onclick: async () => { try { const r = await api('/api/push/test', {}); toast(r.sent ? 'Отправлено — проверьте уведомление' : 'Не удалось доставить — переподключите уведомления'); } catch (x) { toast(x.message); } } }, 'Проверить') : null,
+          here ? h('button', { class: 'btn ghost', onclick: async () => { try { await api('/api/push/unsubscribe', { endpoint: here.endpoint }); await here.unsubscribe(); await refresh(); toast('Выключено на этом устройстве'); close(); } catch (x) { toast(x.message); } } }, 'Выключить') : null)));
+      out.push(h('h2', null, 'Что присылать'));
+      out.push(h('div', { class: 'card' }, KINDS.map(([k, t]) => {
+        const on = prefs[k] !== false;
+        return h('div', { class: 'row', onclick: () => act('/api/push/prefs', { [k]: !on }).then(() => { close(); notifySettings(); }) },
+          h('button', { class: 'chk' + (on ? ' on' : ''), 'aria-label': t }, on ? '✓' : ''), h('div', { class: 'grow' }, t));
+      })));
+      return out;
+    });
+  }
+
   /* ---------- Настройки ---------- */
   async function openSettings() {
     const err = h('div', { class: 'err' });
@@ -551,6 +594,7 @@
         h('button', { class: (S.me.theme || 'neutral') === k ? 'on' : '', onclick: async () => { document.documentElement.dataset.theme = k; if (await act('/api/theme', { theme: k }, 'Оформление сохранено')) { close(); openSettings(); } } }, t))),
       h('div', { class: 'btns', style: 'margin-top:10px' }, h('button', { class: 'btn sec', onclick: () => { close(); calHelp(); } }, 'Календарь iPhone')),
       h('div', { class: 'btns', style: 'margin-top:10px' }, h('button', { class: 'btn sec', onclick: () => { close(); siriHelp(); } }, S.me.siri ? 'Siri: подключена' : 'Подключить Siri')),
+      h('div', { class: 'btns', style: 'margin-top:10px' }, h('button', { class: 'btn sec', onclick: () => { close(); notifySettings(); } }, S.me.pushDevices ? 'Уведомления: включены' : 'Включить уведомления')),
       admin,
       h('div', { class: 'btns', style: 'margin-top:20px' }, h('button', { class: 'btn ghost', onclick: async () => { await api('/api/logout', {}).catch(() => {}); S = null; close(); renderLogin(); } }, 'Выйти'))]);
     if (S.me.role !== 'admin') return;

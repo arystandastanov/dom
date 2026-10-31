@@ -74,7 +74,7 @@ function checkPw(pw, salt, hash) {
 const DUMMY = hashPw(genPassword());
 
 /* ---------------- storage ---------------- */
-const LISTS = ['users', 'sessions', 'tasks', 'events', 'tx', 'bills', 'pays', 'goals', 'deposits', 'notes', 'audit'];
+const LISTS = ['users', 'sessions', 'tasks', 'events', 'tx', 'bills', 'pays', 'goals', 'deposits', 'notes', 'audit', 'push'];
 let db;
 function save() {
   const tmp = DB_FILE + '.tmp';
@@ -123,6 +123,7 @@ function load() {
 }
 function resetAdmin() {
   load();
+setInterval(() => { try { morningJobs(); } catch (e) { console.error('Утренние уведомления:', e.message); } }, 60 * 1000).unref();
   const u = db.users.find(x => x.role === 'admin') || newUser('admin', '', 'admin').u;
   const pw = genPassword(), h = hashPw(pw);
   Object.assign(u, { salt: h.salt, hash: h.hash, active: true, mustChange: true });
@@ -253,7 +254,7 @@ function state(u) {
   const ids = new Set([u.id]);
   const cur = monthL();
   return {
-    me: Object.assign(pubUser(u), { mustChange: !!u.mustChange, calPath: '/cal/' + u.calToken + '.ics', theme: THEMES.includes(u.theme) ? u.theme : (u.role === 'admin' ? 'man' : 'woman'), siri: !!u.siriHash }),
+    me: Object.assign(pubUser(u), { mustChange: !!u.mustChange, calPath: '/cal/' + u.calToken + '.ics', theme: THEMES.includes(u.theme) ? u.theme : (u.role === 'admin' ? 'man' : 'woman'), siri: !!u.siriHash, notify: notifyPrefs(u), pushDevices: db.push.filter(x => x.uid === u.id).length }),
     users: db.users.filter(x => x.active).map(pubUser),
     confirmer: confirmerId(),
     today: todayL(),
@@ -273,7 +274,9 @@ function state(u) {
 function mkTask(u, b) {
   const title = str(b.title, 300); if (!title) throw httpErr(400, 'Напишите, что нужно сделать');
   const t = { id: newId(), title, note: str(b.note, 2000), due: date(b.due), owner: resolveUser(u, b.owner), from: u.id, done: false, doneAt: '', createdAt: nowIso() };
-  db.tasks.push(t); return t;
+  db.tasks.push(t);
+  if (t.owner !== u.id) notify(t.owner, 'family', 'Новое дело от ' + nameOf(u.id), t.title + (t.due ? ' — до ' + humanDate(t.due) : ''), '/#tasks');
+  return t;
 }
 function mkEvent(u, b) {
   const title = str(b.title, 300); if (!title) throw httpErr(400, 'Укажите название встречи');
@@ -281,7 +284,10 @@ function mkEvent(u, b) {
   const forWho = b.for === 'both' ? 'both' : b.for || 'me';
   const e = { id: newId(), title, date: d, time: hhmm(b.time), dur: intIn(b.dur, 5, 1440) || 60, place: str(b.place, 300), note: str(b.note, 2000),
     owner: forWho === 'both' ? u.id : resolveUser(u, forWho), shared: forWho === 'both', createdBy: u.id, createdAt: nowIso() };
-  db.events.push(e); return e;
+  db.events.push(e);
+  const to = e.shared ? others(u).map(x => x.id) : e.owner !== u.id ? [e.owner] : [];
+  to.forEach(id => notify(id, 'family', (e.shared ? 'Общая встреча' : 'Встреча') + ' от ' + nameOf(u.id), e.title + ' — ' + humanDate(e.date) + (e.time ? ', ' + e.time : ''), '/#cal'));
+  return e;
 }
 function mkTx(u, b) {
   const amount = money(b.amount); if (!amount) throw httpErr(400, 'Укажите сумму');
@@ -318,7 +324,9 @@ function payBill(u, b) {
   if (db.pays.some(p => p.billId === bill.id && p.period === period)) throw httpErr(409, 'Этот платёж уже отмечен');
   const amount = money(b.amount); const auto = confirmerId() === u.id;
   const p = { id: newId(), billId: bill.id, period, amount: amount === null ? bill.amount : amount, paidBy: u.id, paidAt: nowIso(), confirmedBy: auto ? u.id : '', confirmedAt: auto ? nowIso() : '' };
-  db.pays.push(p); return p;
+  db.pays.push(p);
+  if (!auto) notify(confirmerId(), 'confirm', 'Подтвердите оплату', nameOf(u.id) + ' оплатил(а) «' + bill.title + '» — ' + fmtMoney(p.amount), '/#family');
+  return p;
 }
 
 /* ---------------- AI: разбор надиктованного текста ---------------- */
@@ -485,7 +493,7 @@ function runTool(u, name, input) {
     const period = b.kind === 'once' ? 'once' : (month(input.month) || monthL());
     const pay = db.pays.find(x => x.billId === b.id && x.period === period);
     if (!pay) throw httpErr(404, 'этот платёж ещё не отмечен оплаченным');
-    if (!pay.confirmedBy) { pay.confirmedBy = u.id; pay.confirmedAt = nowIso(); }
+    if (!pay.confirmedBy) { pay.confirmedBy = u.id; pay.confirmedAt = nowIso(); notifyConfirmed(pay, u); }
     return { ok: true, платёж: b.title, месяц: period };
   }
   throw httpErr(400, 'неизвестное действие');
@@ -529,6 +537,110 @@ async function assistant(u, text, history) {
     }
   } finally { save(); }
   return { reply: reply.replace(/[*_#`]/g, '').trim() || (changed ? 'Готово.' : 'Не получилось ответить — попробуйте сказать иначе.'), changed };
+}
+
+/* ---------------- push-уведомления (Web Push, без внешних библиотек) ---------------- */
+const NOTIFY_DEFAULT = { family: true, confirm: true, confirmed: true, due: true, morning: true };
+const notifyPrefs = u => Object.assign({}, NOTIFY_DEFAULT, u.notify && typeof u.notify === 'object' ? u.notify : {});
+const b64u = b => Buffer.from(b).toString('base64url');
+const MON_G = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+const humanDate = d => { if (!d) return ''; const t = todayL(); if (d === t) return 'сегодня'; if (d === addDaysL(t, 1)) return 'завтра'; return (+d.slice(8)) + ' ' + MON_G[+d.slice(5, 7) - 1]; };
+// Ключи VAPID создаются один раз и хранятся в базе (наружу уходит только открытая часть)
+function vapid() {
+  let v = db.settings.vapid;
+  if (!v || !v.jwk || !v.pub) {
+    const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const jwk = privateKey.export({ format: 'jwk' });
+    v = db.settings.vapid = { jwk, pub: b64u(Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')])) };
+    save();
+  }
+  return v;
+}
+// Отправлять разрешено только на известные сервисы уведомлений (Apple, Google, Mozilla, Microsoft)
+function pushHostOk(ep) {
+  try {
+    const x = new URL(ep); if (x.protocol !== 'https:') return false;
+    const h = x.hostname;
+    if (process.env.PUSH_TEST_HOST && h === process.env.PUSH_TEST_HOST) return true;
+    return /(^|\.)push\.apple\.com$/.test(h) || h === 'fcm.googleapis.com' || /(^|\.)push\.services\.mozilla\.com$/.test(h) || /(^|\.)notify\.windows\.com$/.test(h);
+  } catch (e) { return false; }
+}
+// Шифрование сообщения по RFC 8291 (aes128gcm)
+function encryptPush(sub, payload) {
+  const uaPub = Buffer.from(sub.p256dh, 'base64url'), authSecret = Buffer.from(sub.auth, 'base64url');
+  const ecdh = crypto.createECDH('prime256v1'); ecdh.generateKeys();
+  const asPub = ecdh.getPublicKey(), shared = ecdh.computeSecret(uaPub);
+  const ikm = Buffer.from(crypto.hkdfSync('sha256', shared, authSecret, Buffer.concat([Buffer.from('WebPush: info\0'), uaPub, asPub]), 32));
+  const salt = crypto.randomBytes(16);
+  const cek = Buffer.from(crypto.hkdfSync('sha256', ikm, salt, Buffer.from('Content-Encoding: aes128gcm\0'), 16));
+  const nonce = Buffer.from(crypto.hkdfSync('sha256', ikm, salt, Buffer.from('Content-Encoding: nonce\0'), 12));
+  const c = crypto.createCipheriv('aes-128-gcm', cek, nonce);
+  const body = Buffer.concat([c.update(Buffer.concat([Buffer.from(payload), Buffer.from([2])])), c.final(), c.getAuthTag()]);
+  const rs = Buffer.alloc(4); rs.writeUInt32BE(4096);
+  return Buffer.concat([salt, rs, Buffer.from([asPub.length]), asPub, body]);
+}
+function vapidAuth(endpoint) {
+  const v = vapid(), aud = new URL(endpoint).origin;
+  const data = b64u(JSON.stringify({ typ: 'JWT', alg: 'ES256' })) + '.' + b64u(JSON.stringify({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: 'mailto:noreply@w7desk.kz' }));
+  const sig = crypto.sign('sha256', Buffer.from(data), { key: crypto.createPrivateKey({ key: v.jwk, format: 'jwk' }), dsaEncoding: 'ieee-p1363' });
+  return 'vapid t=' + data + '.' + b64u(sig) + ', k=' + v.pub;
+}
+function sendPush(sub, msg) {
+  return new Promise(resolve => {
+    let body; try { body = encryptPush(sub, JSON.stringify(msg)); } catch (e) { return resolve({ ok: false, gone: true }); }
+    const x = new URL(sub.endpoint);
+    const rq = https.request({ hostname: x.hostname, port: x.port || 443, path: x.pathname + x.search, method: 'POST', timeout: 15000,
+      rejectUnauthorized: !process.env.PUSH_TEST_HOST,
+      headers: { 'Content-Encoding': 'aes128gcm', 'Content-Type': 'application/octet-stream', 'Content-Length': body.length, TTL: '86400', Urgency: 'normal', Authorization: vapidAuth(sub.endpoint) } }, rs => {
+      rs.resume(); rs.on('end', () => resolve({ ok: rs.statusCode >= 200 && rs.statusCode < 300, gone: rs.statusCode === 404 || rs.statusCode === 410, code: rs.statusCode }));
+    });
+    rq.on('timeout', () => rq.destroy(new Error('timeout')));
+    rq.on('error', () => resolve({ ok: false, gone: false }));
+    rq.end(body);
+  });
+}
+async function pushToUser(uid, msg) {
+  const subs = db.push.filter(x => x.uid === uid); let sent = 0, gone = [];
+  for (const s of subs) { const r = await sendPush(s, msg); if (r.ok) sent++; if (r.gone) gone.push(s.endpoint); }
+  if (gone.length) { db.push = db.push.filter(x => !gone.includes(x.endpoint)); save(); }
+  return { sent, devices: subs.length };
+}
+// Не ждём отправки — уведомление уходит в фоне и не задерживает ответ
+function notify(uid, kind, title, body, url) {
+  const u = db.users.find(x => x.id === uid && x.active);
+  if (!u || !notifyPrefs(u)[kind] || !db.push.some(x => x.uid === uid)) return;
+  pushToUser(uid, { title, body: String(body || '').slice(0, 300), url: url || '/', tag: kind + '-' + Date.now() }).catch(() => {});
+}
+function notifyConfirmed(pay, u) {
+  const b = db.bills.find(x => x.id === pay.billId);
+  if (pay.paidBy !== u.id) notify(pay.paidBy, 'confirmed', 'Оплата подтверждена', nameOf(u.id) + ' подтвердил(а): «' + (b ? b.title : '') + '» — ' + fmtMoney(pay.amount), '/#family');
+}
+// Утренние уведомления: 8:30 — сводка на день, 9:00 — платежи на завтра и просроченные
+function morningJobs() {
+  const ln = localNow(), hm = ln.toISOString().slice(11, 16), t = todayL();
+  const sent = db.settings.sent = db.settings.sent || {};
+  if (hm >= '08:30' && hm < '12:00' && sent.morning !== t) {
+    sent.morning = t; save();
+    for (const u of db.users.filter(x => x.active && !x.mustChange)) {
+      const tasks = db.tasks.filter(x => x.owner === u.id && !x.done && x.due && x.due <= t);
+      const ev = db.events.filter(e => (e.owner === u.id || e.shared) && e.date === t).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+      if (!tasks.length && !ev.length) continue;
+      const parts = [];
+      if (ev.length) parts.push('Встречи: ' + ev.map(e => (e.time ? e.time + ' ' : '') + e.title).join('; '));
+      if (tasks.length) parts.push('Дела: ' + tasks.map(x => x.title + (x.due < t ? ' (просрочено)' : '')).join('; '));
+      notify(u.id, 'morning', 'Доброе утро! План на сегодня', parts.join('. '), '/');
+    }
+  }
+  if (hm >= '09:00' && hm < '12:00' && sent.due !== t) {
+    sent.due = t; save();
+    const cur = monthL(), tomorrow = addDaysL(t, 1);
+    const inst = billInstances(addMonths(cur, -3), addMonths(cur, 1)).filter(i => !i.pay && i.due && (i.due === tomorrow || i.due === t || i.due < t));
+    if (inst.length) {
+      const line = i => { const b = db.bills.find(x => x.id === i.billId); return '«' + b.title + '» ' + fmtMoney(i.amount) + (i.due < t ? ' — просрочен' : i.due === t ? ' — сегодня' : ' — завтра'); };
+      const title = inst.some(i => i.due < t) ? 'Есть неоплаченные платежи' : 'Скоро платёж';
+      db.users.filter(x => x.active && !x.mustChange).forEach(u => notify(u.id, 'due', title, inst.map(line).join('; '), '/#family'));
+    }
+  }
 }
 
 /* ---------------- календарь iPhone (подписка .ics) ---------------- */
@@ -695,7 +807,7 @@ async function api(req, res, p, u) {
     const x = find('pays', m[0]); const isConf = confirmerId() === u.id;
     if (body.confirm) {
       if (!isConf) throw httpErr(403, 'Подтверждать оплату может только ' + nameOf(confirmerId()));
-      x.confirmedBy = u.id; x.confirmedAt = nowIso(); audit(req, u, 'confirm', x.id);
+      x.confirmedBy = u.id; x.confirmedAt = nowIso(); notifyConfirmed(x, u); audit(req, u, 'confirm', x.id);
     } else if (body.reject || body.delete) {
       if (x.confirmedBy && !isConf) throw httpErr(403, 'Оплата уже подтверждена — отменить может только ' + nameOf(confirmerId()));
       if (!isConf && x.paidBy !== u.id) throw httpErr(403, 'Отменить отметку может тот, кто её поставил, или ' + nameOf(confirmerId()));
@@ -729,6 +841,27 @@ async function api(req, res, p, u) {
   if (p === '/api/siri/token' && M === 'POST') {
     const tok = crypto.randomBytes(24).toString('base64url'); u.siriHash = sha(tok); audit(req, u, 'siri_on', ''); save();
     return json(res, 200, { path: '/siri/' + tok });
+  }
+  // Уведомления
+  if (p === '/api/push/key' && M === 'GET') return json(res, 200, { key: vapid().pub });
+  if (p === '/api/push/subscribe' && M === 'POST') {
+    const ep = str(body.endpoint, 1000), k = body.keys || {}, p256dh = str(k.p256dh, 200), authk = str(k.auth, 100);
+    if (!pushHostOk(ep)) throw httpErr(400, 'Неизвестный сервис уведомлений');
+    if (!/^[A-Za-z0-9_-]{80,100}$/.test(p256dh) || !/^[A-Za-z0-9_-]{16,30}$/.test(authk)) throw httpErr(400, 'Неверная подписка');
+    db.push = db.push.filter(x => x.endpoint !== ep);
+    db.push.push({ id: newId(), uid: u.id, endpoint: ep, p256dh, auth: authk, ua: str(req.headers['user-agent'], 200), createdAt: nowIso() });
+    if (db.push.length > 50) db.push = db.push.slice(-50);
+    save(); return json(res, 200, { ok: true });
+  }
+  if (p === '/api/push/unsubscribe' && M === 'POST') { const ep = str(body.endpoint, 1000); db.push = db.push.filter(x => !(x.uid === u.id && (!ep || x.endpoint === ep))); save(); return json(res, 200, { ok: true }); }
+  if (p === '/api/push/prefs' && M === 'POST') {
+    const cur = notifyPrefs(u); for (const k of Object.keys(NOTIFY_DEFAULT)) if (k in body) cur[k] = !!body[k];
+    u.notify = cur; save(); return json(res, 200, cur);
+  }
+  if (p === '/api/push/test' && M === 'POST') {
+    if (!db.push.some(x => x.uid === u.id)) throw httpErr(400, 'На этом аккаунте уведомления ещё не включены');
+    const r = await pushToUser(u.id, { title: 'Дом', body: 'Уведомления работают 👍', url: '/' });
+    return json(res, 200, r);
   }
   if (p === '/api/siri/off' && M === 'POST') { delete u.siriHash; audit(req, u, 'siri_off', ''); save(); return json(res, 200, { ok: true }); }
   if (p === '/api/theme' && M === 'POST') {
