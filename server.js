@@ -205,6 +205,15 @@ function readBody(req) {
   });
 }
 
+function readRaw(req, max) {
+  return new Promise((resolve, reject) => {
+    let size = 0; const chunks = [];
+    req.on('data', c => { size += c.length; if (size > max) { reject(httpErr(413, 'Слишком большой запрос')); req.destroy(); } else chunks.push(c); });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
 /* ---------------- domain helpers ---------------- */
 const others = u => db.users.filter(x => x.active && x.id !== u.id);
 const nameOf = id => { const x = db.users.find(y => y.id === id); return x ? (x.name || x.login) : '—'; };
@@ -244,7 +253,7 @@ function state(u) {
   const ids = new Set([u.id]);
   const cur = monthL();
   return {
-    me: Object.assign(pubUser(u), { mustChange: !!u.mustChange, calPath: '/cal/' + u.calToken + '.ics', theme: THEMES.includes(u.theme) ? u.theme : (u.role === 'admin' ? 'man' : 'woman') }),
+    me: Object.assign(pubUser(u), { mustChange: !!u.mustChange, calPath: '/cal/' + u.calToken + '.ics', theme: THEMES.includes(u.theme) ? u.theme : (u.role === 'admin' ? 'man' : 'woman'), siri: !!u.siriHash }),
     users: db.users.filter(x => x.active).map(pubUser),
     confirmer: confirmerId(),
     today: todayL(),
@@ -425,6 +434,101 @@ function applyItems(u, items) {
     } catch (e) { errors.push((it.title || it.type) + ': ' + e.message); }
   }
   return { saved: done.length, errors };
+}
+
+/* ---------------- ассистент: отвечает на вопросы и выполняет поручения ---------------- */
+// Ассистент видит только данные того, кто спрашивает, и общие данные семьи (личный бюджет супруга — нет)
+function snapshot(u) {
+  const t = todayL(), cur = monthL(), until = new Date(Date.parse(t + 'T00:00:00Z') + 45 * 864e5).toISOString().slice(0, 10);
+  const tasks = db.tasks.filter(x => (x.owner === u.id || x.from === u.id) && !x.done).slice(-80)
+    .map(x => ({ дело: x.title, срок: x.due || 'без срока', исполнитель: nameOf(x.owner), поручил: nameOf(x.from), заметка: x.note || undefined }));
+  const events = db.events.filter(e => (e.owner === u.id || e.shared || e.createdBy === u.id) && e.date >= addDaysL(t, -7) && e.date <= until)
+    .sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || ''))).slice(0, 80)
+    .map(e => ({ встреча: e.title, дата: e.date, время: e.time || 'весь день', место: e.place || undefined, для: e.shared ? 'обоих' : nameOf(e.owner) }));
+  const bills = billInstances(addMonths(cur, -2), addMonths(cur, 1)).map(i => {
+    const b = db.bills.find(x => x.id === i.billId);
+    return { платёж: b.title, месяц: i.period === 'once' ? 'разовый' : i.period, срок: i.due, сумма: i.amount,
+      статус: !i.pay ? 'не оплачен' : i.pay.confirmedBy ? 'оплачен и подтверждён' : 'отмечен оплаченным, ждёт подтверждения', отметил: i.pay ? nameOf(i.pay.paidBy) : undefined };
+  });
+  const goals = db.goals.filter(g => !g.archived).map(g => {
+    const have = db.deposits.filter(d => d.goalId === g.id).reduce((a, d) => a + d.amount, 0);
+    return { цель: g.title, накоплено: have, нужно: g.target || undefined, срок: g.deadline || undefined };
+  });
+  const mine = db.tx.filter(x => x.owner === u.id);
+  const month = mine.filter(x => x.date.slice(0, 7) === cur), cats = {};
+  month.filter(x => x.kind === 'expense').forEach(x => { cats[x.category] = (cats[x.category] || 0) + x.amount; });
+  return JSON.stringify({
+    сегодня: t, кто_спрашивает: u.name || u.login, супруг: (others(u)[0] || {}).name || null, подтверждает_оплату: nameOf(confirmerId()),
+    дела: tasks, встречи: events, общие_платежи: bills, накопления: goals,
+    мой_бюджет_за_месяц: { доходы: month.filter(x => x.kind === 'income').reduce((a, x) => a + x.amount, 0), расходы: month.filter(x => x.kind === 'expense').reduce((a, x) => a + x.amount, 0), по_категориям: cats },
+    мои_последние_операции: mine.slice(-15).map(x => ({ дата: x.date, тип: x.kind === 'income' ? 'доход' : 'расход', сумма: x.amount, категория: x.category, комментарий: x.note || undefined })),
+    мои_заметки: db.notes.filter(n => n.owner === u.id).slice(-10).map(n => n.text),
+  });
+}
+const addDaysL = (d, k) => new Date(Date.parse(d + 'T00:00:00Z') + k * 864e5).toISOString().slice(0, 10);
+const ASSIST_TOOLS = [
+  Object.assign({}, ITEM_TOOL, { name: 'add_items', description: 'Добавить записи: дела (в т.ч. поручить супругу), встречи, личные расходы/доходы, общие платежи, отметку об оплате платежа, цели и взносы в накопления, заметки' }),
+  { name: 'complete_task', description: 'Отметить дело выполненным (по названию из списка дел)', input_schema: { type: 'object', required: ['title'], properties: { title: { type: 'string' } } } },
+  { name: 'confirm_payment', description: 'Подтвердить оплату общего платежа, который уже отмечен оплаченным (может только тот, кто подтверждает оплату)', input_schema: { type: 'object', required: ['bill'], properties: { bill: { type: 'string', description: 'название платежа' }, month: { type: 'string', description: 'YYYY-MM, по умолчанию текущий' } } } },
+];
+function runTool(u, name, input) {
+  input = input && typeof input === 'object' ? input : {};
+  if (name === 'add_items') { if (!Array.isArray(input.items)) throw httpErr(400, 'нет записей'); return applyItems(u, input.items); }
+  if (name === 'complete_task') {
+    const t = findByTitle(db.tasks.filter(x => (x.owner === u.id || x.from === u.id) && !x.done), str(input.title, 300));
+    if (!t) throw httpErr(404, 'дело не найдено');
+    t.done = true; t.doneAt = nowIso(); return { ok: true, дело: t.title };
+  }
+  if (name === 'confirm_payment') {
+    if (confirmerId() !== u.id) throw httpErr(403, 'подтверждать оплату может только ' + nameOf(confirmerId()));
+    const b = findByTitle(db.bills.filter(x => !x.archived), str(input.bill, 200)); if (!b) throw httpErr(404, 'платёж не найден');
+    const period = b.kind === 'once' ? 'once' : (month(input.month) || monthL());
+    const pay = db.pays.find(x => x.billId === b.id && x.period === period);
+    if (!pay) throw httpErr(404, 'этот платёж ещё не отмечен оплаченным');
+    if (!pay.confirmedBy) { pay.confirmedBy = u.id; pay.confirmedAt = nowIso(); }
+    return { ok: true, платёж: b.title, месяц: period };
+  }
+  throw httpErr(400, 'неизвестное действие');
+}
+async function assistant(u, text, history) {
+  const s = db.settings;
+  if (!s.aiKey) throw httpErr(400, 'ИИ не подключён — ключ Anthropic указывается в настройках (раздел «ИИ»)');
+  const mon = monthL(), us = db.aiUsage[mon] = db.aiUsage[mon] || { runs: 0, inTok: 0, outTok: 0 };
+  if (us.runs >= AI_MONTH_LIMIT) throw httpErr(429, 'Достигнут месячный лимит обращений к ИИ (' + AI_MONTH_LIMIT + ')');
+  const t = todayL(), wd = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'][new Date(t + 'T00:00:00Z').getUTCDay()];
+  const sys = 'Ты — голосовой помощник семейного планировщика «Дом». С тобой говорит ' + (u.name || 'пользователь') + '. Сегодня ' + t + ' (' + wd + '), часовой пояс UTC+5 (Казахстан), валюта — тенге.\n' +
+    'Отвечай по-русски, коротко и разговорно — 1–3 предложения, без списков, markdown, эмодзи и ссылок: ответ будет зачитан вслух. Суммы пиши словами-числами как обычно («185 тысяч тенге»), даты — по-человечески («в понедельник, 2 ноября»).\n' +
+    'Отвечай только по данным ниже; если чего-то нет — так и скажи, ничего не выдумывай. Чтобы что-то добавить, отметить или подтвердить — вызывай инструменты, а потом коротко скажи, что сделал. ' +
+    'Если поручение неоднозначно (непонятно, на какую дату, или кому) — сначала уточни одним вопросом. Ничего не удаляй — для удаления предложи сделать это в приложении. ' +
+    'Относительные даты переводи в YYYY-MM-DD, выбирая ближайшую будущую. Если просят что-то поручить супругу — who=spouse.\n\nДАННЫЕ:\n' + snapshot(u);
+  const messages = [];
+  for (const m of (Array.isArray(history) ? history : []).slice(-8)) {
+    if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
+    const c = str(m.content, 2000); if (!c) continue;
+    if (!messages.length && m.role !== 'user') continue;
+    if (messages.length && messages[messages.length - 1].role === m.role) messages[messages.length - 1].content += '\n' + c; else messages.push({ role: m.role, content: c });
+  }
+  if (messages.length && messages[messages.length - 1].role === 'user') messages.pop();
+  messages.push({ role: 'user', content: text });
+  let reply = '', changed = false;
+  try {
+    for (let turn = 0; turn < 5; turn++) {
+      us.runs++;
+      const resp = await claudeCall({ model: AI_MODELS.includes(s.aiModel) ? s.aiModel : AI_MODELS[0], max_tokens: 1500, system: sys, tools: ASSIST_TOOLS, messages }, s.aiKey);
+      if (resp.usage) { us.inTok += resp.usage.input_tokens || 0; us.outTok += resp.usage.output_tokens || 0; }
+      const content = Array.isArray(resp.content) ? resp.content : [];
+      const uses = content.filter(c => c.type === 'tool_use');
+      const said = content.filter(c => c.type === 'text').map(c => c.text).join(' ').trim();
+      if (!uses.length || resp.stop_reason !== 'tool_use') { reply = said; break; }
+      messages.push({ role: 'assistant', content });
+      messages.push({ role: 'user', content: uses.map(c => {
+        let out; try { out = runTool(u, c.name, c.input); changed = true; } catch (e) { out = { ошибка: e.message }; }
+        return { type: 'tool_result', tool_use_id: c.id, content: JSON.stringify(out) };
+      }) });
+      reply = said;
+    }
+  } finally { save(); }
+  return { reply: reply.replace(/[*_#`]/g, '').trim() || (changed ? 'Готово.' : 'Не получилось ответить — попробуйте сказать иначе.'), changed };
 }
 
 /* ---------------- календарь iPhone (подписка .ics) ---------------- */
@@ -615,6 +719,18 @@ async function api(req, res, p, u) {
     if (body.delete) db.deposits = db.deposits.filter(x => x !== d);
     save(); return json(res, 200, { ok: true });
   }
+  if (p === '/api/assistant' && M === 'POST') {
+    const text = str(body.text, 3000); if (!text) throw httpErr(400, 'Пустой вопрос');
+    if (blocked('ai:' + u.id, 60)) throw httpErr(429, 'Слишком часто — подождите немного');
+    fail('ai:' + u.id);
+    return json(res, 200, await assistant(u, text, body.history));
+  }
+  // Siri: личная секретная ссылка; храним только её отпечаток
+  if (p === '/api/siri/token' && M === 'POST') {
+    const tok = crypto.randomBytes(24).toString('base64url'); u.siriHash = sha(tok); audit(req, u, 'siri_on', ''); save();
+    return json(res, 200, { path: '/siri/' + tok });
+  }
+  if (p === '/api/siri/off' && M === 'POST') { delete u.siriHash; audit(req, u, 'siri_off', ''); save(); return json(res, 200, { ok: true }); }
   if (p === '/api/theme' && M === 'POST') {
     if (!THEMES.includes(body.theme)) throw httpErr(400, 'Неизвестное оформление');
     u.theme = body.theme; save(); return json(res, 200, { ok: true });
@@ -670,6 +786,27 @@ const server = http.createServer(async (req, res) => {
       if (!u) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('Календарь не найден'); }
       res.writeHead(200, { 'Content-Type': 'text/calendar; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Robots-Tag': 'noindex' });
       return res.end(ics(u));
+    }
+    m = p.match(/^\/siri\/([A-Za-z0-9_-]{20,64})$/);
+    if (m && req.method === 'POST') {
+      const h = sha(m[1]), u = db.users.find(x => x.active && x.siriHash && x.siriHash === h);
+      const send = (code, t) => { res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(t); };
+      if (!u) return send(404, 'Ссылка для Siri не найдена — выдайте новую в настройках «Дома».');
+      if (u.mustChange) return send(403, 'Сначала войдите в «Дом» и задайте пароль.');
+      if (blocked('siri:' + u.id, 60)) return send(429, 'Слишком часто, подождите немного.');
+      fail('siri:' + u.id);
+      const raw = await readRaw(req, 20000), ct = req.headers['content-type'] || '';
+      let text = '';
+      try {
+        if (/json/.test(ct)) { const j = JSON.parse(raw || '{}'); text = typeof j === 'string' ? j : j.text || j.Text || ''; }
+        else if (/x-www-form-urlencoded/.test(ct)) text = new URLSearchParams(raw).get('text') || '';
+        else if (/multipart/.test(ct)) { const mm = raw.match(/name="text"\r?\n\r?\n([\s\S]*?)\r?\n--/); text = mm ? mm[1] : ''; }
+        else text = raw;
+      } catch (e) { text = ''; }
+      text = str(text, 3000);
+      if (!text) return send(400, 'Я ничего не расслышал.');
+      try { const r = await assistant(u, text, []); return send(200, r.reply); }
+      catch (e) { return send(200, e.code && e.code < 500 ? e.message : 'Не получилось — попробуйте ещё раз.'); }
     }
     if (p.startsWith('/api/')) {
       // Защита от подделки запросов с чужих сайтов: изменения принимаем только как JSON

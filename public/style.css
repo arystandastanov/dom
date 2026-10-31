@@ -144,3 +144,9 @@ html[data-theme="woman"] .stat { border-radius: 18px; }
     --accent: #e88aab; --accent-ink: #2a1019; --accent-soft: #3d2530;
   }
 }
+
+/* ассистент */
+.chat { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; margin-bottom: 10px; -webkit-overflow-scrolling: touch; }
+.msg { padding: 10px 14px; border-radius: 18px; max-width: 86%; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.4; }
+.msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-ink); border-bottom-right-radius: 6px; }
+.msg.assistant { align-self: flex-start; background: var(--card); box-shadow: var(--shadow); border-bottom-left-radius: 6px; }

@@ -104,7 +104,7 @@
     $app.replaceChildren(
       h('header', { class: 'top' }, h('h1', null, TITLES[UI.view] || 'Дом'), h('button', { class: 'iconbtn', 'aria-label': 'Настройки', onclick: openSettings }, '⚙︎')),
       h('main', { class: 'main' }, body()),
-      h('button', { class: 'mic', 'aria-label': 'Надиктовать', onclick: openDictate }, '🎙'),
+      h('button', { class: 'mic', 'aria-label': 'Ассистент', onclick: openAssistant }, '🎙'),
       h('nav', { class: 'nav' }, VIEWS.map(([k, i, t]) => h('button', { class: UI.view === k ? 'on' : '', onclick: () => go(k) }, h('span', { class: 'i' }, i), t))));
     window.scrollTo(0, y);
   }
@@ -391,6 +391,61 @@
         !n ? h('button', { class: 'btn danger', onclick: async () => { if (confirm('Убрать цель?') && await act('/api/goals/' + g.id, { delete: true }, 'Цель убрана')) close(); } }, 'Удалить') : null)));
   }
 
+  /* ---------- Ассистент: вопросы и поручения, ответ голосом ---------- */
+  let CHAT = [], spoken = false;
+  let voiceOn = true;
+  try { voiceOn = localStorage.getItem('dom.voice') !== '0'; } catch (e) {}
+  const ruVoice = () => { const vs = window.speechSynthesis ? speechSynthesis.getVoices() : []; return vs.find(v => /^ru(-|_|$)/i.test(v.lang) && /Milena|Yuri|Katya|Google/i.test(v.name)) || vs.find(v => /^ru/i.test(v.lang)); };
+  // iPhone разрешает озвучку только после нажатия — «будим» её беззвучной фразой прямо в момент нажатия кнопки
+  function unlockSpeech() {
+    if (spoken || !window.speechSynthesis) return;
+    try { const x = new SpeechSynthesisUtterance(' '); x.volume = 0; x.lang = 'ru-RU'; speechSynthesis.speak(x); spoken = true; } catch (e) {}
+  }
+  function speak(t) {
+    if (!voiceOn || !window.speechSynthesis || !t) return;
+    try { speechSynthesis.cancel(); const x = new SpeechSynthesisUtterance(t); x.lang = 'ru-RU'; const v = ruVoice(); if (v) x.voice = v; x.rate = 1.05; speechSynthesis.speak(x); } catch (e) {}
+  }
+  function openAssistant() {
+    if (!S.ai.configured) { openDictate(); return; }
+    const sp = spouse();
+    const log = h('div', { class: 'chat', 'aria-live': 'polite' });
+    const draw = () => {
+      log.replaceChildren(...(CHAT.length ? CHAT.map(m => h('div', { class: 'msg ' + m.role }, m.text)) :
+        [h('div', { class: 'hint', style: 'padding:4px 2px' }, 'Спросите или поручите голосом — нажмите 🎤 на клавиатуре iPhone. Например: «Что у меня завтра?», «Сколько осталось заплатить в этом месяце?», «Сколько отложили на отпуск?»' + (sp ? ', «Поставь ' + sp.name + ' задачу купить хлеб»' : '') + '.')]));
+      log.scrollTop = log.scrollHeight;
+    };
+    draw();
+    const ta = h('textarea', { rows: 2, style: 'min-height:60px', placeholder: 'Спросите или поручите…', 'aria-label': 'Вопрос ассистенту', enterkeyhint: 'send' });
+    const send = h('button', { class: 'btn', style: 'flex:1' }, 'Отправить');
+    const vbtn = h('button', { class: 'btn sec', 'aria-label': 'Озвучка ответов' });
+    const vfill = () => { vbtn.textContent = voiceOn ? '🔊' : '🔇'; };
+    vfill();
+    vbtn.onclick = () => { voiceOn = !voiceOn; try { localStorage.setItem('dom.voice', voiceOn ? '1' : '0'); } catch (e) {} if (!voiceOn && window.speechSynthesis) speechSynthesis.cancel(); else unlockSpeech(); vfill(); toast(voiceOn ? 'Ответы озвучиваются' : 'Озвучка выключена'); };
+    const go = async () => {
+      const text = ta.value.trim(); if (!text || send.disabled) { ta.focus(); return; }
+      unlockSpeech();
+      const hist = CHAT.slice(-8).map(m => ({ role: m.role, content: m.text }));
+      CHAT.push({ role: 'user', text }); ta.value = ''; draw();
+      send.disabled = true; send.textContent = 'Думаю…';
+      try {
+        const r = await api('/api/assistant', { text, history: hist });
+        CHAT.push({ role: 'assistant', text: r.reply }); draw(); speak(r.reply);
+        if (r.changed) await refresh();
+      } catch (e) { CHAT.push({ role: 'assistant', text: e.message }); draw(); }
+      send.disabled = false; send.textContent = 'Отправить';
+    };
+    send.onclick = go;
+    ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); go(); } });
+    sheet('Ассистент', close => [
+      log,
+      h('div', { class: 'card form' }, ta, h('div', { class: 'btns' }, send, vbtn)),
+      h('div', { class: 'btns', style: 'margin-top:8px;justify-content:space-between' },
+        h('button', { class: 'btn ghost sm', onclick: () => { CHAT = []; if (window.speechSynthesis) speechSynthesis.cancel(); draw(); } }, 'Новый разговор'),
+        h('button', { class: 'btn ghost sm', onclick: () => { if (window.speechSynthesis) speechSynthesis.cancel(); close(); openDictate(); } }, 'Много записей с проверкой →'))]);
+    setTimeout(() => ta.focus(), 250);
+  }
+  if (window.speechSynthesis) { try { speechSynthesis.getVoices(); speechSynthesis.onvoiceschanged = () => {}; } catch (e) {} }
+
   /* ---------- Надиктовать ---------- */
   const TYPES = { task: 'Дело', event: 'Встреча', expense: 'Расход', income: 'Доход', bill: 'Общий платёж', bill_paid: 'Оплата платежа', goal: 'Цель', deposit: 'В накопления', note: 'Заметка' };
   function openDictate() {
@@ -455,6 +510,32 @@
     out.replaceChildren(h('h2', null, 'Проверьте'), h('div', { class: 'card' }, rows.map(r => r.row)), h('div', { class: 'btns', style: 'margin-top:12px' }, save));
   }
 
+  function siriHelp(url) {
+    const box = h('div', { style: 'display:grid;gap:10px' });
+    const step = (n, ...t) => h('div', { class: 'row', style: 'align-items:flex-start;padding:10px 0;border-top:1px solid var(--line)' }, h('span', { class: 'badge' }, String(n)), h('div', { class: 'grow' }, ...t));
+    if (url) box.append(
+      h('div', { class: 'hint' }, 'Ваша личная ссылка для Siri. Она даёт доступ к вашим делам и бюджету — никому её не пересылайте.'),
+      h('div', { class: 'mono pwbox' }, url),
+      h('button', { class: 'btn', onclick: () => { navigator.clipboard && navigator.clipboard.writeText(url).then(() => toast('Ссылка скопирована'), () => toast('Скопируйте вручную')); } }, 'Скопировать ссылку'),
+      h('div', { class: 'card pad' },
+        h('b', null, 'Настройка на iPhone (один раз, 2 минуты)'),
+        step(1, 'Откройте приложение «Команды» → вкладка «Команды» → «+».'),
+        step(2, 'Найдите и добавьте действие «Диктовать текст». Язык — русский.'),
+        step(3, 'Добавьте действие «Получить содержимое URL». Вставьте скопированную ссылку. Нажмите «›» (подробнее): Метод — ', h('b', null, 'POST'), ', Текст запроса — ', h('b', null, 'Форма'), '. Нажмите «Добавить поле» → «Текст»: ключ ', h('b', null, 'text'), ', значение — выберите переменную «Продиктованный текст».'),
+        step(4, 'Добавьте действие «Произнести текст» — в нём должно стоять «Содержимое URL».'),
+        step(5, 'Вверху назовите команду ', h('b', null, 'Дом'), ' и нажмите «Готово». Теперь говорите: «Привет, Siri, Дом» — и ваш вопрос или поручение.')));
+    else box.append(
+      h('div', { class: 'hint' }, 'Говорите «Привет, Siri, Дом» — и задавайте вопрос или поручение голосом, а ответ Siri прочитает вслух. Работает и с заблокированного экрана, и в машине.'),
+      S.me.siri ? h('div', { class: 'hint' }, 'Siri уже подключена. Если потеряли телефон или хотите настроить заново — выдайте новую ссылку, старая перестанет работать.') : null);
+    sheet('Siri', close => [box,
+      h('div', { class: 'btns', style: 'margin-top:12px' },
+        h('button', { class: url ? 'btn ghost' : 'btn', onclick: async () => {
+          if (S.me.siri && !url && !confirm('Старая ссылка для Siri перестанет работать. Продолжить?')) return;
+          try { const r = await api('/api/siri/token', {}); close(); await refresh(); siriHelp(location.origin + r.path); } catch (e) { toast(e.message); }
+        } }, url ? 'Выдать другую ссылку' : S.me.siri ? 'Выдать новую ссылку' : 'Получить ссылку для Siri'),
+        S.me.siri ? h('button', { class: 'btn ghost', onclick: async () => { if (confirm('Отключить Siri? Команда на iPhone перестанет работать.') && await act('/api/siri/off', {}, 'Siri отключена')) close(); } }, 'Отключить') : null)]);
+  }
+
   /* ---------- Настройки ---------- */
   async function openSettings() {
     const err = h('div', { class: 'err' });
@@ -469,6 +550,7 @@
       h('div', { class: 'seg' }, [['man', 'Мужское'], ['woman', 'Женское'], ['neutral', 'Нейтральное']].map(([k, t]) =>
         h('button', { class: (S.me.theme || 'neutral') === k ? 'on' : '', onclick: async () => { document.documentElement.dataset.theme = k; if (await act('/api/theme', { theme: k }, 'Оформление сохранено')) { close(); openSettings(); } } }, t))),
       h('div', { class: 'btns', style: 'margin-top:10px' }, h('button', { class: 'btn sec', onclick: () => { close(); calHelp(); } }, 'Календарь iPhone')),
+      h('div', { class: 'btns', style: 'margin-top:10px' }, h('button', { class: 'btn sec', onclick: () => { close(); siriHelp(); } }, S.me.siri ? 'Siri: подключена' : 'Подключить Siri')),
       admin,
       h('div', { class: 'btns', style: 'margin-top:20px' }, h('button', { class: 'btn ghost', onclick: async () => { await api('/api/logout', {}).catch(() => {}); S = null; close(); renderLogin(); } }, 'Выйти'))]);
     if (S.me.role !== 'admin') return;
