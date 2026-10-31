@@ -112,3 +112,35 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); ou
 #toast.on { opacity: .95; }
 .mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; user-select: all; -webkit-user-select: all; }
 .pwbox { background: var(--wait-soft); color: var(--ink); border-radius: 12px; padding: 12px; }
+
+/* ---------- Оформление у каждого своё ---------- */
+/* Мужское: строгое, графит и тёмно-синий, острее углы */
+html[data-theme="man"] {
+  --bg: #eceff3; --card: #ffffff; --ink: #121a24; --muted: #5d6875; --line: #d8dee6;
+  --accent: #1f4e79; --accent-ink: #ffffff; --accent-soft: #dce6f0;
+  --shadow: 0 1px 2px rgba(10, 20, 35, .08); --r: 10px;
+}
+html[data-theme="man"] .top h1 { font-weight: 800; letter-spacing: -.01em; text-transform: uppercase; font-size: 24px; }
+html[data-theme="man"] .btn, html[data-theme="man"] input, html[data-theme="man"] select, html[data-theme="man"] textarea { border-radius: 8px; }
+html[data-theme="man"] .mic { border-radius: 14px; }
+html[data-theme="man"] h2 { letter-spacing: .1em; }
+/* Женское: мягкое, пудровая роза, круглее углы */
+html[data-theme="woman"] {
+  --bg: #fbf2f3; --card: #ffffff; --ink: #2d1e24; --muted: #8a6f78; --line: #f0dde2;
+  --accent: #c0577a; --accent-ink: #ffffff; --accent-soft: #fbe3ea;
+  --shadow: 0 2px 10px rgba(192, 87, 122, .08); --r: 22px;
+}
+html[data-theme="woman"] .top h1 { font-family: Georgia, "Times New Roman", serif; font-weight: 600; font-style: italic; }
+html[data-theme="woman"] .btn, html[data-theme="woman"] input, html[data-theme="woman"] select, html[data-theme="woman"] textarea { border-radius: 16px; }
+html[data-theme="woman"] .seg, html[data-theme="woman"] .seg button { border-radius: 16px; }
+html[data-theme="woman"] .stat { border-radius: 18px; }
+@media (prefers-color-scheme: dark) {
+  html[data-theme="man"] {
+    --bg: #0e1319; --card: #18202a; --ink: #e8edf3; --muted: #93a0ae; --line: #2a3542;
+    --accent: #5b9bd5; --accent-ink: #0b1622; --accent-soft: #1c2c3d;
+  }
+  html[data-theme="woman"] {
+    --bg: #1b1417; --card: #261c21; --ink: #f6e9ed; --muted: #c2a3ad; --line: #3a2a31;
+    --accent: #e88aab; --accent-ink: #2a1019; --accent-soft: #3d2530;
+  }
+}

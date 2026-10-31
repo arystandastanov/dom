@@ -97,6 +97,7 @@
   const TITLES = { home: 'Главная', tasks: 'Дела', cal: 'Календарь', money: 'Мои деньги', family: 'Семья' };
   function render() {
     if (!S) return renderLogin();
+    document.documentElement.dataset.theme = S.me.theme || 'neutral';
     if (S.me.mustChange) return renderFirst();
     const y = window.scrollY;
     const body = { home: vHome, tasks: vTasks, cal: vCal, money: vMoney, family: vFamily }[UI.view] || vHome;
@@ -464,6 +465,9 @@
       h('h2', null, 'Профиль'),
       h('div', { class: 'card form' }, h('label', { class: 'f' }, 'Имя', name), old, pw, err,
         h('button', { class: 'btn sec', onclick: async () => { err.textContent = ''; try { await api('/api/password', { old: old.value, password: pw.value, name: name.value }); toast('Сохранено'); old.value = pw.value = ''; await refresh(); } catch (e) { err.textContent = e.message; } } }, 'Сменить пароль')),
+      h('h2', null, 'Оформление'),
+      h('div', { class: 'seg' }, [['man', 'Мужское'], ['woman', 'Женское'], ['neutral', 'Нейтральное']].map(([k, t]) =>
+        h('button', { class: (S.me.theme || 'neutral') === k ? 'on' : '', onclick: async () => { document.documentElement.dataset.theme = k; if (await act('/api/theme', { theme: k }, 'Оформление сохранено')) { close(); openSettings(); } } }, t))),
       h('div', { class: 'btns', style: 'margin-top:10px' }, h('button', { class: 'btn sec', onclick: () => { close(); calHelp(); } }, 'Календарь iPhone')),
       admin,
       h('div', { class: 'btns', style: 'margin-top:20px' }, h('button', { class: 'btn ghost', onclick: async () => { await api('/api/logout', {}).catch(() => {}); S = null; close(); renderLogin(); } }, 'Выйти'))]);

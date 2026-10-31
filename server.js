@@ -25,6 +25,7 @@ const MAX_BODY = 100 * 1024;
 const COOKIE = 'dom_sess';
 const AI_MODELS = ['claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-opus-5-5'];
 const AI_MONTH_LIMIT = 1500;   // разборов текста в месяц на семью — защита от случайного перерасхода
+const THEMES = ['man', 'woman', 'neutral'];   // оформление у каждого своё
 
 /* ---------------- utils ---------------- */
 const nowIso = () => new Date().toISOString();
@@ -243,7 +244,7 @@ function state(u) {
   const ids = new Set([u.id]);
   const cur = monthL();
   return {
-    me: Object.assign(pubUser(u), { mustChange: !!u.mustChange, calPath: '/cal/' + u.calToken + '.ics' }),
+    me: Object.assign(pubUser(u), { mustChange: !!u.mustChange, calPath: '/cal/' + u.calToken + '.ics', theme: THEMES.includes(u.theme) ? u.theme : (u.role === 'admin' ? 'man' : 'woman') }),
     users: db.users.filter(x => x.active).map(pubUser),
     confirmer: confirmerId(),
     today: todayL(),
@@ -359,7 +360,7 @@ async function parseText(u, text) {
   const sp = others(u)[0];
   const sys = 'Ты помощник семейного планировщика. Говорящий — ' + (u.name || 'пользователь') + (sp ? ', второй супруг — ' + (sp.name || sp.login) : '') + '. ' +
     'Сегодня ' + t + ' (' + wd + '), часовой пояс UTC+5 (Казахстан). Валюта — тенге. ' +
-    'Разбери надиктованный текст (он может быть с ошибками распознавания речи) на отдельные записи и вызови save_items. ' +
+    'Разбери надиктованный текст (он может быть с ошибками распознавания речи) на отдельные записи и ОБЯЗАТЕЛЬНО вызови инструмент save_items (без пояснений текстом). ' +
     'Относительные даты («завтра», «в пятницу», «10-го») переводи в YYYY-MM-DD, выбирая ближайшую будущую дату. ' +
     'Встреча — только если есть дата или день; дело без даты — task. Ничего не выдумывай: суммы, даты и время — только названные. ' +
     'Если говорящий просит что-то сделать супруга — who=spouse.\n' +
@@ -367,11 +368,17 @@ async function parseText(u, text) {
     'Существующие цели накоплений: ' + (db.goals.filter(g => !g.archived).map(g => '«' + g.title + '»').join(', ') || 'нет') + '.';
   us.runs++;
   const resp = await claudeCall({ model: AI_MODELS.includes(s.aiModel) ? s.aiModel : AI_MODELS[0], max_tokens: 4000, system: sys,
-    tools: [ITEM_TOOL], tool_choice: { type: 'tool', name: 'save_items' }, messages: [{ role: 'user', content: text }] }, s.aiKey);
+    tools: [ITEM_TOOL], tool_choice: { type: 'auto' }, messages: [{ role: 'user', content: text }] }, s.aiKey);
   if (resp.usage) { us.inTok += resp.usage.input_tokens || 0; us.outTok += resp.usage.output_tokens || 0; }
   save();
-  const call = (resp.content || []).find(c => c.type === 'tool_use');
-  const items = call && call.input && Array.isArray(call.input.items) ? call.input.items : [];
+  // Обычно модель вызывает save_items; если вместо этого ответила текстом с JSON — берём его оттуда
+  const call = (resp.content || []).find(c => c.type === 'tool_use' && c.name === 'save_items');
+  let items = call && call.input && Array.isArray(call.input.items) ? call.input.items : null;
+  if (!items) {
+    const txt = (resp.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
+    const m = txt.match(/\{[\s\S]*"items"[\s\S]*\}|\[[\s\S]*\]/);
+    try { const j = m ? JSON.parse(m[0]) : null; items = Array.isArray(j) ? j : j && Array.isArray(j.items) ? j.items : []; } catch (e) { items = []; }
+  }
   return items.slice(0, 40).map(normItem).filter(Boolean);
 }
 // Приводим ответ ИИ к проверенному виду — ему не доверяем так же, как пользователю
@@ -607,6 +614,10 @@ async function api(req, res, p, u) {
     const d = find('deposits', m[0]); if (d.by !== u.id) throw httpErr(403, 'Удалить взнос может тот, кто его внёс');
     if (body.delete) db.deposits = db.deposits.filter(x => x !== d);
     save(); return json(res, 200, { ok: true });
+  }
+  if (p === '/api/theme' && M === 'POST') {
+    if (!THEMES.includes(body.theme)) throw httpErr(400, 'Неизвестное оформление');
+    u.theme = body.theme; save(); return json(res, 200, { ok: true });
   }
   // Календарь: новая секретная ссылка (старая перестаёт работать)
   if (p === '/api/cal/rotate' && M === 'POST') { u.calToken = crypto.randomBytes(24).toString('base64url'); save(); return json(res, 200, { calPath: '/cal/' + u.calToken + '.ics' }); }
